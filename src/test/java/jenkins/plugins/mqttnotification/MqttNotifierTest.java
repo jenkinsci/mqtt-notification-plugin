@@ -1,6 +1,5 @@
 package jenkins.plugins.mqttnotification;
 
-import com.cloudbees.plugins.credentials.common.StandardUsernamePasswordCredentials;
 import hudson.EnvVars;
 import hudson.model.FreeStyleBuild;
 import hudson.model.FreeStyleProject;
