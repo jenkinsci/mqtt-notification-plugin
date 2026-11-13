@@ -19,6 +19,7 @@ import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.interceptor.RequirePOST;
 
 import com.cloudbees.plugins.credentials.CredentialsMatchers;
 import com.cloudbees.plugins.credentials.CredentialsProvider;
@@ -33,10 +34,12 @@ import hudson.Launcher;
 import hudson.model.AbstractBuild;
 import hudson.model.AbstractProject;
 import hudson.model.Item;
+import hudson.model.Queue;
 import hudson.model.Result;
 import hudson.model.Run;
 import hudson.model.TaskListener;
 import hudson.model.User;
+import hudson.model.queue.Tasks;
 import hudson.plugins.emailext.plugins.recipients.RecipientProviderUtilities;
 import hudson.plugins.emailext.plugins.recipients.RecipientProviderUtilities.IDebug;
 import hudson.security.ACL;
@@ -46,9 +49,9 @@ import hudson.tasks.Notifier;
 import hudson.tasks.Publisher;
 import hudson.util.FormValidation;
 import hudson.util.ListBoxModel;
-import jenkins.model.Jenkins;
 import jenkins.tasks.SimpleBuildStep;
 import net.sf.json.JSONObject;
+import org.springframework.security.core.Authentication;
 
 /**
  * A simple build result notifier that publishes the result via MQTT.
@@ -229,16 +232,21 @@ public class MqttNotifier extends Notifier implements SimpleBuildStep {
         return true;
     }
 
-    static StandardUsernamePasswordCredentials lookupSystemCredentials(final String credentialsId) {
-        return CredentialsMatchers.firstOrNull(
-            CredentialsProvider.lookupCredentials(
-                StandardUsernamePasswordCredentials.class,
-                Jenkins.getInstance(),
-                ACL.SYSTEM,
-                new ArrayList<DomainRequirement>()
-            ),
-            CredentialsMatchers.withId(credentialsId)
+    static StandardUsernamePasswordCredentials lookupItemCredentials(final Item context, final String credentialsId) {
+        if (context == null || isNullOrEmpty(credentialsId)) {
+            return null;
+        }
+        return CredentialsProvider.findCredentialByIdInItem(
+            credentialsId,
+            StandardUsernamePasswordCredentials.class,
+            context,
+            getJobAuthentication(context),
+            new ArrayList<DomainRequirement>()
         );
+    }
+
+    private static Authentication getJobAuthentication(final Item context) {
+        return context instanceof Queue.Task ? Tasks.getAuthenticationOf2((Queue.Task) context) : ACL.SYSTEM2;
     }
 
     private static String getClientId() {
@@ -256,9 +264,13 @@ public class MqttNotifier extends Notifier implements SimpleBuildStep {
         final MqttDefaultFilePersistence dataStore = new MqttDefaultFilePersistence(tmpDir);
         try (final MqttClient mqtt = new MqttClient(this.getBrokerUrl(), getClientId(), dataStore)) {
             final MqttConnectOptions mqttConnectOptions = new MqttConnectOptions();
-            final StandardUsernamePasswordCredentials credentials = MqttNotifier
-                    .lookupSystemCredentials(this.credentialsId);
+            final StandardUsernamePasswordCredentials credentials = lookupItemCredentials(run.getParent(), this.credentialsId);
+            if (!isNullOrEmpty(this.credentialsId) && credentials == null) {
+                logger.println("ERROR: MQTT credentials not found or not available to this job");
+                return;
+            }
             if (credentials != null) {
+                CredentialsProvider.track(run, credentials);
                 mqttConnectOptions.setUserName(credentials.getUsername());
                 mqttConnectOptions.setPassword(credentials.getPassword().getPlainText().toCharArray());
             }
@@ -308,20 +320,29 @@ public class MqttNotifier extends Notifier implements SimpleBuildStep {
             return items;
         }
 
+        @RequirePOST
         public FormValidation doTestConnection(
+                @AncestorInPath final Item context,
                 @QueryParameter("brokerUrl") final String brokerUrl,
                 @QueryParameter("credentialsId") final String credentialsId) {
 
+            if (context == null) {
+                return FormValidation.error("Job context is required");
+            }
+            context.checkPermission(Item.CONFIGURE);
             if (brokerUrl == null || brokerUrl.trim().isEmpty()) {
                 return FormValidation.error("Broker URL must not be empty");
+            }
+
+            final StandardUsernamePasswordCredentials credentials = MqttNotifier.lookupItemCredentials(context, credentialsId);
+            if (!isNullOrEmpty(credentialsId) && credentials == null) {
+                return FormValidation.error("Credentials not found or not available to this job");
             }
 
             final String tmpDir = System.getProperty("java.io.tmpdir");
             final MqttDefaultFilePersistence dataStore = new MqttDefaultFilePersistence(tmpDir);
             try (final MqttClient mqtt = new MqttClient(brokerUrl, getClientId(), dataStore)){
                 final MqttConnectOptions mqttConnectOptions = new MqttConnectOptions();
-
-                final StandardUsernamePasswordCredentials credentials = MqttNotifier.lookupSystemCredentials(credentialsId);
 
                 if (credentials != null) {
                     mqttConnectOptions.setUserName(credentials.getUsername());
@@ -336,19 +357,26 @@ public class MqttNotifier extends Notifier implements SimpleBuildStep {
             }
         }
 
-        public ListBoxModel doFillCredentialsIdItems(@AncestorInPath final Item context) {
-            return context != null && context.hasPermission(Item.CONFIGURE)
-                ? new StandardUsernameListBoxModel()
-                .withEmptySelection()
-                .withAll(
-                    CredentialsProvider.lookupCredentials(
-                        StandardUsernamePasswordCredentials.class,
-                        context,
-                        ACL.SYSTEM,
-                        new ArrayList<DomainRequirement>()
-                    )
-                )
-                : new ListBoxModel();
+        public ListBoxModel doFillCredentialsIdItems(
+                @AncestorInPath final Item context, @QueryParameter final String credentialsId) {
+            final StandardUsernameListBoxModel items = new StandardUsernameListBoxModel();
+            if (context != null && context.hasPermission(Item.CONFIGURE)) {
+                items.includeEmptyValue();
+                items.includeAs(getJobAuthentication(context), context,
+                    StandardUsernamePasswordCredentials.class, new ArrayList<DomainRequirement>());
+            }
+            return items.includeCurrentValue(credentialsId);
+        }
+
+        public FormValidation doCheckCredentialsId(
+                @AncestorInPath final Item context, @QueryParameter final String value) {
+            if (context == null || !context.hasPermission(Item.CONFIGURE) || isNullOrEmpty(value)) {
+                return FormValidation.ok();
+            }
+            return CredentialsProvider.listCredentialsInItem(
+                StandardUsernamePasswordCredentials.class, context, getJobAuthentication(context),
+                new ArrayList<DomainRequirement>(), CredentialsMatchers.withId(value)
+            ).isEmpty() ? FormValidation.error("Credentials not found or not available to this job") : FormValidation.ok();
         }
 
         @Override
